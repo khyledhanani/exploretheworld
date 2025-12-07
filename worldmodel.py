@@ -372,8 +372,105 @@ class WorldModel(nn.Module):
             'policy_probs': policy_probs,
         }
     
+    def forward_sequence(self, obs, action, h_prev=None, z_prev=None):
+        """
+        Efficient forward pass for a sequence of observations.
+        Batches the heavy Encoder and Decoder operations.
+        
+        Args:
+            obs: (B, T, 3, 64, 64)
+            action: (B, T, action_dim) - action[t] is action taken at time t (input for t+1)
+            h_prev: (B, hidden_dim) initial state
+            z_prev: (B, stochastic_dim) initial state
+        
+        Returns:
+            dict with stacked outputs
+        """
+        B, T = obs.shape[:2]
+        device = obs.device
+        
+        # 1. Batch Encode
+        # Flatten time dimension: (B*T, C, H, W)
+        obs_flat = obs.view(B * T, *obs.shape[2:])
+        e_seq_flat = self.encoder(obs_flat)
+        e_seq = e_seq_flat.view(B, T, -1)
+        
+        # 2. RSSM Loop (Sequential)
+        if h_prev is None:
+            h_prev = torch.zeros(B, self.hidden_dim, device=device)
+        if z_prev is None:
+            z_prev = torch.zeros(B, self.stochastic_dim, device=device)
+            
+        h_seq = []
+        z_seq = []
+        prior_means = []
+        prior_stds = []
+        post_means = []
+        post_stds = []
+        
+        # Current states
+        h_t = h_prev
+        z_t = z_prev
+        
+        for t in range(T):
+            # For RSSM step t, we need action_{t-1}. 
+            # Assuming action sequence is aligned such that action[:, t] is the action taken at step t.
+            # The dynamics are: h_t = f(h_{t-1}, z_{t-1}, a_{t-1})
+            
+            if t == 0:
+                # For the first step, we usually assume a zero action or provided prev action
+                # Here we assume zero action for simplicity of the sequence
+                a_prev = torch.zeros(B, self.action_dim, device=device)
+            else:
+                a_prev = action[:, t-1]
+            
+            # Prior: Predict t from t-1
+            h_t, z_t_prior, prior_dist = self.rssm.prior(h_t, z_t, a_prev)
+            
+            # Posterior: Correct using encoded observation at t
+            e_t = e_seq[:, t]
+            z_t, post_dist = self.rssm.posterior(h_t, e_t)
+            
+            # Store
+            h_seq.append(h_t)
+            z_seq.append(z_t)
+            
+            prior_means.append(prior_dist.mean)
+            prior_stds.append(prior_dist.stddev)
+            post_means.append(post_dist.mean)
+            post_stds.append(post_dist.stddev)
+            
+        # Stack temporal dimension
+        h_seq = torch.stack(h_seq, dim=1) # (B, T, H)
+        z_seq = torch.stack(z_seq, dim=1) # (B, T, Z)
+        
+        # Create batched distributions
+        prior_dist_seq = Normal(torch.stack(prior_means, dim=1), torch.stack(prior_stds, dim=1))
+        post_dist_seq = Normal(torch.stack(post_means, dim=1), torch.stack(post_stds, dim=1))
+        
+        # 3. Batch Decode & Heads
+        h_flat = h_seq.view(B * T, -1)
+        z_flat = z_seq.view(B * T, -1)
+        
+        o_hat_flat = self.decoder(h_flat, z_flat)
+        r_hat_flat = self.reward_head(h_flat, z_flat)
+        v_hat_flat = self.value_head(h_flat, z_flat)
+        policy_logits_flat, policy_probs_flat = self.policy_prior_head(h_flat, z_flat)
+        
+        return {
+            'o_hat_t': o_hat_flat.view(B, T, *obs.shape[2:]),
+            'r_hat_t': r_hat_flat.view(B, T),
+            'v_hat_t': v_hat_flat.view(B, T),
+            'policy_logits': policy_logits_flat.view(B, T, -1),
+            'policy_probs': policy_probs_flat.view(B, T, -1),
+            'prior_dist': prior_dist_seq,
+            'post_dist': post_dist_seq,
+            'h_t': h_t, # final state
+            'z_t': z_t, # final state
+        }
+    
     def compute_loss(self, obs, action, reward, value_targets=None, h_prev=None, z_prev=None, 
-                     recon_loss_weight=1.0, reward_loss_weight=1.0, kl_loss_weight=0.1, value_loss_weight=1.0):
+                     recon_loss_weight=1.0, reward_loss_weight=1.0, kl_loss_weight=0.1, value_loss_weight=1.0, free_nats=0.0):
         """
         Compute training losses:
         - Reconstruction loss (MSE)

@@ -63,17 +63,17 @@ config = {
     
     # Training hyperparameters
     'batch_size': 64,
-    'seq_length': 50,
+    'seq_length': 30,
     'learning_rate': 3e-4,
     'num_collection_episodes': 100,
-    'num_training_steps': 50000,
-    'collect_every_n_steps': 50,
+    'num_training_steps': 30000,
+    'collect_every_n_steps': 250,
     
     # Loss weights / regularization balance
     'lambda_rec': 10.0,
     'lambda_kl_start': 0.0,
     'lambda_kl_end': 1.0,
-    'kl_anneal_steps': 20000,
+    'kl_anneal_steps': 15000,
     'lambda_reward': 1.0,
     'lambda_value': 1.0,
     'free_nats': 0.0,
@@ -98,10 +98,11 @@ class ReplayBuffer:
     """
     Replay buffer for storing trajectories.
     Stores: (o_t, a_t, r_t, o_{t+1}, done_t)
+    Optimized for sequence sampling using list instead of deque for slicing speed.
     """
     def __init__(self, capacity=10000):
         self.capacity = capacity
-        self.buffer = deque(maxlen=capacity)
+        self.buffer = [] 
     
     def add(self, obs, action, reward, next_obs, done):
         """Add a single transition"""
@@ -112,6 +113,8 @@ class ReplayBuffer:
             'next_obs': next_obs,
             'done': done,
         })
+        if len(self.buffer) > self.capacity:
+            self.buffer.pop(0)
     
     def add_trajectory(self, trajectory):
         """Add a full trajectory"""
@@ -130,25 +133,30 @@ class ReplayBuffer:
         max_start = len(self.buffer) - seq_length
         starts = np.random.randint(0, max_start, size=batch_size)
         
-        obs_seq = []
-        action_seq = []
-        reward_seq = []
-        done_seq = []
+        # Pre-allocate arrays for speed
+        obs_sample = self.buffer[0]['obs']
+        obs_shape = obs_sample.shape
         
-        for start in starts:
-            # Extract sequence
-            seq = [self.buffer[start + i] for i in range(seq_length)]
+        obs_seq = np.zeros((batch_size, seq_length, *obs_shape), dtype=np.float32)
+        action_seq = np.zeros((batch_size, seq_length), dtype=np.int64)
+        reward_seq = np.zeros((batch_size, seq_length), dtype=np.float32)
+        done_seq = np.zeros((batch_size, seq_length), dtype=np.float32)
+        
+        for i, start in enumerate(starts):
+            # Fast slice 
+            seq = self.buffer[start : start + seq_length]
             
-            obs_seq.append([s['obs'] for s in seq])
-            action_seq.append([s['action'] for s in seq])
-            reward_seq.append([s['reward'] for s in seq])
-            done_seq.append([s['done'] for s in seq])
+            for t, item in enumerate(seq):
+                obs_seq[i, t] = item['obs']
+                action_seq[i, t] = item['action']
+                reward_seq[i, t] = item['reward']
+                done_seq[i, t] = item['done']
         
         # Convert to tensors
-        obs_tensor = torch.stack([torch.stack([torch.tensor(o, dtype=torch.float32) for o in obs]) for obs in obs_seq])
-        action_tensor = torch.stack([torch.stack([F.one_hot(torch.tensor(a, dtype=torch.long), config['action_dim']).float() for a in action]) for action in action_seq])
-        reward_tensor = torch.stack([torch.tensor(reward, dtype=torch.float32) for reward in reward_seq])
-        done_tensor = torch.stack([torch.tensor(done, dtype=torch.float32) for done in done_seq])
+        obs_tensor = torch.tensor(obs_seq, dtype=torch.float32)
+        action_tensor = F.one_hot(torch.tensor(action_seq, dtype=torch.long), config['action_dim']).float()
+        reward_tensor = torch.tensor(reward_seq, dtype=torch.float32)
+        done_tensor = torch.tensor(done_seq, dtype=torch.float32)
         
         return obs_tensor, action_tensor, reward_tensor, done_tensor
     
@@ -453,30 +461,12 @@ for step in tqdm(range(config['num_training_steps']), desc="Training"):
     h_prev = None
     z_prev = None
     
-    # Forward pass through sequence
-    all_outputs = []
-    for t in range(T):
-        obs_t = obs_seq[:, t]
-        action_t = action_seq[:, t]
-        
-        # Use previous action for RSSM (or zero for first step)
-        if t == 0:
-            action_prev = torch.zeros(B, config['action_dim'], device=device)
-        else:
-            action_prev = action_seq[:, t-1]
-        
-        # Forward pass
-        outputs = model(obs_t, action_prev, h_prev, z_prev, use_posterior=True)
-        all_outputs.append(outputs)
-        
-        # Update states for next step
-        h_prev = outputs['h_t']
-        z_prev = outputs['z_t']
+    # Optimized Forward pass through sequence using batching
+    outputs = model.forward_sequence(obs_seq, action_seq, h_prev, z_prev)
     
-    # Stack outputs: (B, T, ...)
-    o_hat_seq = torch.stack([o['o_hat_t'] for o in all_outputs], dim=1)
-    r_hat_seq = torch.stack([o['r_hat_t'] for o in all_outputs], dim=1)
-    v_hat_seq = torch.stack([o['v_hat_t'] for o in all_outputs], dim=1)
+    o_hat_seq = outputs['o_hat_t']
+    r_hat_seq = outputs['r_hat_t']
+    v_hat_seq = outputs['v_hat_t']
     
     # Compute n-step returns for value targets (detach values for bootstrapping)
     with torch.no_grad():
@@ -492,35 +482,30 @@ for step in tqdm(range(config['num_training_steps']), desc="Training"):
     value_loss = F.mse_loss(v_hat_seq, value_targets)
     
     # KL loss with FREE BITS constraint (sum over sequence, mean over batch)
-    kl_loss_raw = torch.tensor(0.0, device=device)
     kl_loss = torch.tensor(0.0, device=device)
-    posterior_stds = []
-    prior_stds = []
+    kl_loss_raw = torch.tensor(0.0, device=device)
     
-    for t in range(T):
-        if all_outputs[t]['prior_dist'] is not None and all_outputs[t]['post_dist'] is not None:
-            # Per-dimension KL divergence
-            kl_per_dim = torch.distributions.kl.kl_divergence(
-                all_outputs[t]['post_dist'],
-                all_outputs[t]['prior_dist']
-            )
-            
-            # Raw KL (for logging)
-            kl_t_raw = kl_per_dim.sum(dim=-1).mean()
-            kl_loss_raw += kl_t_raw
-            
-            # Free bits: don't penalize the first `free_nats` nats per dim
-            free_nats = config['free_nats']
-            kl_per_dim_clamped = torch.clamp(kl_per_dim - free_nats, min=0.0)
-            kl_t = kl_per_dim_clamped.sum(dim=-1).mean()
-            kl_loss += kl_t
-            
-            # Track std for diagnosing posterior collapse
-            posterior_stds.append(all_outputs[t]['post_dist'].stddev.mean().item())
-            prior_stds.append(all_outputs[t]['prior_dist'].stddev.mean().item())
-    
-    kl_loss = kl_loss / T
-    kl_loss_raw = kl_loss_raw / T
+    if outputs['prior_dist'] is not None and outputs['post_dist'] is not None:
+        # Per-dimension KL divergence
+        kl_per_dim = torch.distributions.kl.kl_divergence(
+            outputs['post_dist'],
+            outputs['prior_dist']
+        ) # (B, T, Z)
+        
+        # Raw KL (for logging)
+        kl_loss_raw = kl_per_dim.sum(dim=-1).mean()
+        
+        # Free bits: don't penalize the first `free_nats` nats per dim
+        free_nats = config['free_nats']
+        kl_per_dim_clamped = torch.clamp(kl_per_dim - free_nats, min=0.0)
+        kl_loss = kl_per_dim_clamped.sum(dim=-1).mean()
+        
+        # Track std for diagnosing posterior collapse
+        # Average over B and T
+        post_std_mean = outputs['post_dist'].stddev.mean().item()
+        prior_std_mean = outputs['prior_dist'].stddev.mean().item()
+        posterior_stds.append(post_std_mean)
+        prior_stds.append(prior_std_mean)
     
     # Total loss
     total_loss = (
