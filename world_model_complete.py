@@ -63,20 +63,20 @@ config = {
     
     # Training hyperparameters
     'batch_size': 64,
-    'seq_length': 16,
+    'seq_length': 50,
     'learning_rate': 3e-4,
     'num_collection_episodes': 100,
-    'num_training_steps': 10000,
+    'num_training_steps': 50000,
     'collect_every_n_steps': 50,
     
     # Loss weights / regularization balance
     'lambda_rec': 10.0,
     'lambda_kl_start': 0.0,
-    'lambda_kl_end': 0.10,
-    'kl_anneal_steps': 4000,
+    'lambda_kl_end': 1.0,
+    'kl_anneal_steps': 20000,
     'lambda_reward': 1.0,
     'lambda_value': 1.0,
-    'free_nats': 1.0,
+    'free_nats': 0.0,
     
     # N-step returns
     'n_step': 5,
@@ -506,13 +506,13 @@ for step in tqdm(range(config['num_training_steps']), desc="Training"):
             )
             
             # Raw KL (for logging)
-            kl_t_raw = kl_per_dim.mean()
+            kl_t_raw = kl_per_dim.sum(dim=-1).mean()
             kl_loss_raw += kl_t_raw
             
             # Free bits: don't penalize the first `free_nats` nats per dim
             free_nats = config['free_nats']
             kl_per_dim_clamped = torch.clamp(kl_per_dim - free_nats, min=0.0)
-            kl_t = kl_per_dim_clamped.mean()
+            kl_t = kl_per_dim_clamped.sum(dim=-1).mean()
             kl_loss += kl_t
             
             # Track std for diagnosing posterior collapse
@@ -1134,7 +1134,7 @@ def muzero_training_step(model, optimizer, batch, device, config, step):
                 all_outputs[t]['prior_dist']
             )
             kl_per_dim_clamped = torch.clamp(kl_per_dim - config['free_nats'], min=0.0)
-            kl_loss += kl_per_dim_clamped.mean()
+            kl_loss += kl_per_dim_clamped.sum(dim=-1).mean()
     kl_loss = kl_loss / T
     
     # 4. Value loss - use n-step returns computed from rewards
