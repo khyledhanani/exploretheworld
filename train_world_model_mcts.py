@@ -504,6 +504,85 @@ def run_mcts_episode(env, model, device, config, max_steps=500,
     return trajectory, total_reward, len(trajectory)
 
 
+def plot_warmup_losses(losses_history, save_path='warmup_losses.png'):
+    """Plot warmup training losses with diagnostics."""
+    fig, axes = plt.subplots(3, 3, figsize=(18, 12))
+    
+    # Row 1: Main losses
+    axes[0, 0].plot(losses_history['total'])
+    axes[0, 0].set_title('Total Loss')
+    axes[0, 0].set_xlabel('Step')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].grid(True)
+    
+    axes[0, 1].plot(losses_history['recon'])
+    axes[0, 1].set_title('Reconstruction Loss')
+    axes[0, 1].set_xlabel('Step')
+    axes[0, 1].set_ylabel('Loss')
+    axes[0, 1].grid(True)
+    
+    axes[0, 2].plot(losses_history['reward'])
+    axes[0, 2].set_title('Reward Prediction Loss')
+    axes[0, 2].set_xlabel('Step')
+    axes[0, 2].set_ylabel('Loss')
+    axes[0, 2].grid(True)
+    
+    # Row 2: KL diagnostics
+    axes[1, 0].plot(losses_history['kl_raw'], label='Raw KL', alpha=0.7)
+    axes[1, 0].plot(losses_history['kl'], label='Clamped KL (free bits)', alpha=0.7)
+    axes[1, 0].set_title('KL Divergence Loss')
+    axes[1, 0].set_xlabel('Step')
+    axes[1, 0].set_ylabel('Loss')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True)
+    
+    axes[1, 1].plot(losses_history['kl_weight'])
+    axes[1, 1].set_title('KL Weight (Annealing Schedule)')
+    axes[1, 1].set_xlabel('Step')
+    axes[1, 1].set_ylabel('Weight')
+    axes[1, 1].grid(True)
+    
+    axes[1, 2].plot(losses_history['value'])
+    axes[1, 2].set_title('Value Prediction Loss')
+    axes[1, 2].set_xlabel('Step')
+    axes[1, 2].set_ylabel('Loss')
+    axes[1, 2].grid(True)
+    
+    # Row 3: Posterior collapse diagnostics
+    axes[2, 0].plot(losses_history['posterior_std'], label='Posterior', alpha=0.7)
+    axes[2, 0].plot(losses_history['prior_std'], label='Prior', alpha=0.7)
+    axes[2, 0].set_title('Latent Distribution Std Devs')
+    axes[2, 0].set_xlabel('Step')
+    axes[2, 0].set_ylabel('Std Dev')
+    axes[2, 0].legend()
+    axes[2, 0].grid(True)
+    axes[2, 0].axhline(y=0.1, color='r', linestyle='--', alpha=0.3)
+    
+    # Rolling average for smoothed view
+    if len(losses_history['total']) > 100:
+        window = 100
+        smoothed_total = np.convolve(losses_history['total'], 
+                                     np.ones(window)/window, mode='valid')
+        axes[2, 1].plot(smoothed_total)
+        axes[2, 1].set_title(f'Total Loss (smoothed, window={window})')
+        axes[2, 1].set_xlabel('Step')
+        axes[2, 1].set_ylabel('Loss')
+        axes[2, 1].grid(True)
+    
+    # KL vs Reconstruction trade-off
+    axes[2, 2].scatter(losses_history['kl'], losses_history['recon'], 
+                       alpha=0.3, s=1)
+    axes[2, 2].set_title('KL vs Reconstruction Trade-off')
+    axes[2, 2].set_xlabel('KL Loss')
+    axes[2, 2].set_ylabel('Reconstruction Loss')
+    axes[2, 2].grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"Warmup losses plot saved to {save_path}")
+    plt.close()
+
+
 def train_world_model_warmup(model, optimizer, replay_buffer, device, config):
     """Warm-up training phase: train world model on heuristic data."""
     model.train()
@@ -760,6 +839,173 @@ def muzero_training_step(model, optimizer, batch, device, config, step):
     }
 
 
+def plot_combined_summary(warmup_losses, mcts_history, save_path='training_summary.png'):
+    """Plot combined summary of warmup and MCTS training."""
+    fig = plt.figure(figsize=(16, 10))
+    gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
+    
+    # Top row: Episode metrics
+    ax1 = fig.add_subplot(gs[0, :2])
+    ax1.plot(mcts_history['episode_rewards'], alpha=0.6, label='Episode Reward')
+    if len(mcts_history['episode_rewards']) > 10:
+        window = min(20, len(mcts_history['episode_rewards']) // 5)
+        smoothed = np.convolve(mcts_history['episode_rewards'], 
+                              np.ones(window)/window, mode='valid')
+        ax1.plot(range(window-1, len(mcts_history['episode_rewards'])), 
+                smoothed, 'r-', linewidth=2, label=f'{window}-ep moving avg')
+    ax1.set_title('MCTS Episode Rewards', fontsize=12, fontweight='bold')
+    ax1.set_xlabel('Episode')
+    ax1.set_ylabel('Total Reward')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    ax2 = fig.add_subplot(gs[0, 2])
+    ax2.hist(mcts_history['episode_rewards'], bins=30, alpha=0.7, edgecolor='black')
+    ax2.set_title('Reward Distribution', fontsize=12)
+    ax2.set_xlabel('Reward')
+    ax2.set_ylabel('Count')
+    ax2.grid(True, alpha=0.3, axis='y')
+    
+    # Middle row: Loss evolution across both phases
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax3.plot(warmup_losses['recon'], alpha=0.5, label='Warmup', color='blue')
+    if len(mcts_history['recon_loss']) > 0:
+        warmup_steps = len(warmup_losses['recon'])
+        ax3.plot(range(warmup_steps, warmup_steps + len(mcts_history['recon_loss'])),
+                mcts_history['recon_loss'], alpha=0.5, label='MCTS', color='orange')
+        ax3.axvline(x=warmup_steps, color='red', linestyle='--', alpha=0.5, label='MCTS Start')
+    ax3.set_title('Reconstruction Loss', fontsize=12)
+    ax3.set_xlabel('Training Step')
+    ax3.set_ylabel('Loss')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+    
+    ax4 = fig.add_subplot(gs[1, 1])
+    ax4.plot(warmup_losses['value'], alpha=0.5, label='Warmup', color='blue')
+    if len(mcts_history['value_loss']) > 0:
+        warmup_steps = len(warmup_losses['value'])
+        ax4.plot(range(warmup_steps, warmup_steps + len(mcts_history['value_loss'])),
+                mcts_history['value_loss'], alpha=0.5, label='MCTS', color='orange')
+        ax4.axvline(x=warmup_steps, color='red', linestyle='--', alpha=0.5, label='MCTS Start')
+    ax4.set_title('Value Loss', fontsize=12)
+    ax4.set_xlabel('Training Step')
+    ax4.set_ylabel('Loss')
+    ax4.legend()
+    ax4.grid(True, alpha=0.3)
+    
+    ax5 = fig.add_subplot(gs[1, 2])
+    if len(mcts_history['policy_loss']) > 0:
+        ax5.plot(mcts_history['policy_loss'], alpha=0.7, color='green')
+        ax5.set_title('Policy Distillation Loss', fontsize=12)
+        ax5.set_xlabel('Training Step')
+        ax5.set_ylabel('Loss')
+        ax5.grid(True, alpha=0.3)
+    
+    # Bottom row: KL and diagnostics
+    ax6 = fig.add_subplot(gs[2, 0])
+    ax6.plot(warmup_losses['kl'], label='Warmup KL', alpha=0.7, color='blue')
+    if len(mcts_history['kl_loss']) > 0:
+        warmup_steps = len(warmup_losses['kl'])
+        ax6.plot(range(warmup_steps, warmup_steps + len(mcts_history['kl_loss'])),
+                mcts_history['kl_loss'], alpha=0.7, label='MCTS KL', color='orange')
+        ax6.axvline(x=warmup_steps, color='red', linestyle='--', alpha=0.5)
+    ax6.set_title('KL Divergence', fontsize=12)
+    ax6.set_xlabel('Training Step')
+    ax6.set_ylabel('Loss')
+    ax6.legend()
+    ax6.grid(True, alpha=0.3)
+    
+    ax7 = fig.add_subplot(gs[2, 1])
+    ax7.plot(warmup_losses['posterior_std'], label='Posterior', alpha=0.7)
+    ax7.plot(warmup_losses['prior_std'], label='Prior', alpha=0.7)
+    ax7.axhline(y=0.1, color='r', linestyle='--', alpha=0.3, label='Collapse threshold')
+    ax7.set_title('Latent Std Dev (Warmup)', fontsize=12)
+    ax7.set_xlabel('Step')
+    ax7.set_ylabel('Std Dev')
+    ax7.legend()
+    ax7.grid(True, alpha=0.3)
+    
+    ax8 = fig.add_subplot(gs[2, 2])
+    if len(mcts_history['episode_lengths']) > 0:
+        ax8.plot(mcts_history['episode_lengths'], alpha=0.6)
+        if len(mcts_history['episode_lengths']) > 10:
+            window = min(20, len(mcts_history['episode_lengths']) // 5)
+            smoothed = np.convolve(mcts_history['episode_lengths'], 
+                                  np.ones(window)/window, mode='valid')
+            ax8.plot(range(window-1, len(mcts_history['episode_lengths'])), 
+                    smoothed, 'r-', linewidth=2)
+        ax8.set_title('Episode Lengths', fontsize=12)
+        ax8.set_xlabel('Episode')
+        ax8.set_ylabel('Steps')
+        ax8.grid(True, alpha=0.3)
+    
+    plt.suptitle('Training Summary: Warmup + MCTS', fontsize=14, fontweight='bold')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"Combined training summary saved to {save_path}")
+    plt.close()
+
+
+def plot_mcts_training(training_history, save_path='mcts_training.png'):
+    """Plot MCTS training results."""
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    # Episode rewards
+    axes[0, 0].plot(training_history['episode_rewards'])
+    axes[0, 0].set_title('Episode Rewards (MCTS)')
+    axes[0, 0].set_xlabel('Episode')
+    axes[0, 0].set_ylabel('Total Reward')
+    axes[0, 0].grid(True)
+    
+    # Add rolling average if enough data
+    if len(training_history['episode_rewards']) > 10:
+        window = 10
+        smoothed = np.convolve(training_history['episode_rewards'], 
+                              np.ones(window)/window, mode='valid')
+        axes[0, 0].plot(range(window-1, len(training_history['episode_rewards'])), 
+                       smoothed, 'r-', alpha=0.7, linewidth=2, label=f'{window}-ep avg')
+        axes[0, 0].legend()
+    
+    # Episode lengths
+    axes[0, 1].plot(training_history['episode_lengths'])
+    axes[0, 1].set_title('Episode Lengths')
+    axes[0, 1].set_xlabel('Episode')
+    axes[0, 1].set_ylabel('Steps')
+    axes[0, 1].grid(True)
+    
+    # Total loss
+    axes[0, 2].plot(training_history['total_loss'])
+    axes[0, 2].set_title('Total Loss')
+    axes[0, 2].set_xlabel('Training Step')
+    axes[0, 2].set_ylabel('Loss')
+    axes[0, 2].grid(True)
+    
+    # Policy loss (distillation)
+    axes[1, 0].plot(training_history['policy_loss'])
+    axes[1, 0].set_title('Policy Distillation Loss')
+    axes[1, 0].set_xlabel('Training Step')
+    axes[1, 0].set_ylabel('Loss')
+    axes[1, 0].grid(True)
+    
+    # Value loss
+    axes[1, 1].plot(training_history['value_loss'])
+    axes[1, 1].set_title('Value Loss')
+    axes[1, 1].set_xlabel('Training Step')
+    axes[1, 1].set_ylabel('Loss')
+    axes[1, 1].grid(True)
+    
+    # Reconstruction loss
+    axes[1, 2].plot(training_history['recon_loss'])
+    axes[1, 2].set_title('Reconstruction Loss')
+    axes[1, 2].set_xlabel('Training Step')
+    axes[1, 2].set_ylabel('Loss')
+    axes[1, 2].grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"MCTS training plot saved to {save_path}")
+    plt.close()
+
+
 def train_with_mcts(model, optimizer, mcts_replay_buffer, env, device, config):
     """MCTS training loop."""
     training_history = {
@@ -881,18 +1127,19 @@ def main():
     for k, v in config.items():
         print(f"  {k}: {v}")
     
-    # Initialize environment
+    # Initialize environment for warmup (with reward shaping)
     print("\nInitializing environment...")
     with suppress_output():
         env_base = gym.make(config['env_name'], render_mode='rgb_array')
-    env = ShapedRewardWrapper(
+    env_warmup = ShapedRewardWrapper(
         env_base,
         shaping_scale=0.1,
         goal_bonus=10.0,
         near_goal_threshold=0.8
     )
     print(f"Environment: {config['env_name']}")
-    print(f"Action space: {env.action_space}")
+    print(f"Action space: {env_warmup.action_space}")
+    print("Using reward shaping for warmup phase")
     
     # Initialize world model
     print("\nInitializing world model...")
@@ -916,14 +1163,18 @@ def main():
         model.load_state_dict(checkpoint['model_state_dict'])
         print("Checkpoint loaded!")
         
-        print("\nRunning evaluation...")
+        print("\nRunning evaluation (without reward shaping)...")
+        # Create environment without reward shaping for evaluation
+        with suppress_output():
+            env_eval = gym.make(config['env_name'], render_mode='rgb_array')
+        
         model.eval()
         eval_rewards = []
         eval_lengths = []
         
         for i in range(20):
             traj, reward, length = run_mcts_episode(
-                env=env,
+                env=env_eval,
                 model=model,
                 device=device,
                 config=config,
@@ -939,15 +1190,21 @@ def main():
         print(f"  Mean reward: {np.mean(eval_rewards):.2f} ± {np.std(eval_rewards):.2f}")
         print(f"  Mean length: {np.mean(eval_lengths):.1f} ± {np.std(eval_lengths):.1f}")
         
-        env.close()
+        env_eval.close()
+        env_warmup.close()
         return
     
     # Warm-up training or load checkpoint
+    losses_history = None  # Initialize for later use in combined plot
     if args.load_warmup:
         print(f"\nLoading warm-up checkpoint from {args.load_warmup}...")
         checkpoint = torch.load(args.load_warmup, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # Try to load losses history if available
+        if 'losses_history' in checkpoint:
+            losses_history = checkpoint['losses_history']
+            print("Loaded warmup losses history from checkpoint")
         print("Warm-up checkpoint loaded!")
         
         # Initialize MCTS replay buffer
@@ -966,7 +1223,7 @@ def main():
         
         for episode in tqdm(range(config['num_collection_episodes']), desc="Collecting"):
             trajectory, total_reward, traj_length = collect_trajectory(
-                env, heuristic_policy, config, max_steps=500
+                env_warmup, heuristic_policy, config, max_steps=500
             )
             replay_buffer.add_trajectory(trajectory)
             episode_rewards.append(total_reward)
@@ -987,6 +1244,9 @@ def main():
         
         print("\nTraining complete!")
         
+        # Plot warmup losses
+        plot_warmup_losses(losses_history, save_path='warmup_losses.png')
+        
         # Save warm-up checkpoint
         torch.save({
             'model_state_dict': model.state_dict(),
@@ -998,7 +1258,7 @@ def main():
         
         if args.warmup_only:
             print("\nWarm-up only mode. Exiting.")
-            env.close()
+            env_warmup.close()
             return
         
         # Initialize MCTS replay buffer with warm-up data
@@ -1021,9 +1281,27 @@ def main():
     print("Phase 3: MCTS Training")
     print("="*60)
     
+    # Create new environment WITHOUT reward shaping for MCTS
+    print("Creating new environment without reward shaping for MCTS...")
+    with suppress_output():
+        env_mcts = gym.make(config['env_name'], render_mode='rgb_array')
+    print("Using raw rewards (no shaping) for MCTS phase")
+    
+    # Close warmup environment if it exists
+    if 'env_warmup' in locals():
+        env_warmup.close()
+    
     mcts_training_history = train_with_mcts(
-        model, optimizer, mcts_replay_buffer, env, device, config
+        model, optimizer, mcts_replay_buffer, env_mcts, device, config
     )
+    
+    # Plot MCTS training results
+    plot_mcts_training(mcts_training_history, save_path='mcts_training.png')
+    
+    # Plot combined summary if we have warmup losses
+    if 'losses_history' in locals() and losses_history is not None:
+        plot_combined_summary(losses_history, mcts_training_history, 
+                            save_path='training_summary.png')
     
     # Save MCTS checkpoint
     torch.save({
@@ -1045,7 +1323,7 @@ def main():
     print(f"Last 10 episodes mean: "
           f"{np.mean(mcts_training_history['episode_rewards'][-10:]):.2f}")
     
-    env.close()
+    env_mcts.close()
     print("\nDone!")
 
 
