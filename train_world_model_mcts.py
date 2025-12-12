@@ -63,9 +63,10 @@ def get_config():
         'lambda_kl_end': 0.10,
         'kl_anneal_steps': 4000,
         'lambda_reward': 1.0,
-        'lambda_value': 1.0,
+        'lambda_value': 10.0,  # Increased from 1.0 to force value learning with sparse rewards
         'lambda_policy': 1.0,
         'free_nats': 1.0,
+        'use_huber_value_loss': True,  # Use Huber loss for more robust value learning
         
         # N-step returns
         'n_step': 5,
@@ -671,7 +672,12 @@ def train_world_model_warmup(model, optimizer, replay_buffer, device, config):
         # Compute losses
         recon_loss = F.mse_loss(o_hat_seq, obs_seq)
         reward_loss = F.mse_loss(r_hat_seq, reward_seq)
-        value_loss = F.mse_loss(v_hat_seq, value_targets)
+        
+        # Use Huber loss for value function for more robust learning
+        if config.get('use_huber_value_loss', False):
+            value_loss = F.smooth_l1_loss(v_hat_seq, value_targets)
+        else:
+            value_loss = F.mse_loss(v_hat_seq, value_targets)
         
         # KL loss with free bits
         kl_loss_raw = torch.tensor(0.0, device=device)
@@ -793,13 +799,27 @@ def muzero_training_step(model, optimizer, batch, device, config, step):
             kl_loss += kl_per_dim_clamped.mean()
     kl_loss = kl_loss / T
     
-    # Value loss
+    # Value loss with MCTS value targets when available
     with torch.no_grad():
+        # Compute n-step returns as baseline
         n_step_returns = compute_n_step_returns(
             reward_seq, done_seq, v_hat_seq.detach(),
             gamma=config['gamma'], n_step=config['n_step']
         )
-    value_loss = F.mse_loss(v_hat_seq, n_step_returns)
+        
+        # Use MCTS value targets when available, otherwise use n-step returns
+        value_targets = n_step_returns.clone()
+        if has_mcts.any():
+            # Replace n-step returns with MCTS value estimates for trajectories that have them
+            for b_idx in range(B):
+                if has_mcts[b_idx]:
+                    value_targets[b_idx] = value_target[b_idx]
+    
+    # Use Huber loss for more robust value learning with sparse rewards
+    if config.get('use_huber_value_loss', False):
+        value_loss = F.smooth_l1_loss(v_hat_seq, value_targets)
+    else:
+        value_loss = F.mse_loss(v_hat_seq, value_targets)
     
     # Policy distillation loss
     policy_loss = torch.tensor(0.0, device=device)
@@ -836,6 +856,13 @@ def muzero_training_step(model, optimizer, batch, device, config, step):
         'value_loss': value_loss.item(),
         'policy_loss': policy_loss.item() if isinstance(policy_loss, torch.Tensor) else policy_loss,
         'kl_weight': kl_weight,
+        # Add value diagnostics
+        'value_pred_mean': v_hat_seq.mean().item(),
+        'value_pred_std': v_hat_seq.std().item(),
+        'value_target_mean': value_targets.mean().item(),
+        'value_target_std': value_targets.std().item(),
+        'reward_mean': reward_seq.mean().item(),
+        'has_mcts_frac': has_mcts.float().mean().item(),
     }
 
 
@@ -1017,6 +1044,9 @@ def train_with_mcts(model, optimizer, mcts_replay_buffer, env, device, config):
         'kl_loss': [],
         'value_loss': [],
         'policy_loss': [],
+        'value_pred_mean': [],
+        'value_target_mean': [],
+        'reward_mean': [],
     }
     
     print("\n" + "="*60)
@@ -1075,6 +1105,9 @@ def train_with_mcts(model, optimizer, mcts_replay_buffer, env, device, config):
             training_history['kl_loss'].append(losses['kl_loss'])
             training_history['value_loss'].append(losses['value_loss'])
             training_history['policy_loss'].append(losses['policy_loss'])
+            training_history['value_pred_mean'].append(losses['value_pred_mean'])
+            training_history['value_target_mean'].append(losses['value_target_mean'])
+            training_history['reward_mean'].append(losses['reward_mean'])
             
             global_step += 1
         
@@ -1099,7 +1132,10 @@ def train_with_mcts(model, optimizer, mcts_replay_buffer, env, device, config):
             print(f"  Eval reward: {eval_reward:.2f} (length: {eval_length})")
             print(f"  Temperature: {temperature:.3f}")
             print(f"  Losses - Total: {losses['total_loss']:.4f}, "
-                  f"Policy: {losses['policy_loss']:.4f}")
+                  f"Policy: {losses['policy_loss']:.4f}, Value: {losses['value_loss']:.4f}")
+            print(f"  Value Pred: {losses['value_pred_mean']:.4f} ± {losses['value_pred_std']:.4f}")
+            print(f"  Value Target: {losses['value_target_mean']:.4f} ± {losses['value_target_std']:.4f}")
+            print(f"  Reward Mean: {losses['reward_mean']:.4f}, MCTS coverage: {losses['has_mcts_frac']:.2%}")
             print(f"  Buffer size: {len(mcts_replay_buffer)}")
     
     print("\n" + "="*60)
