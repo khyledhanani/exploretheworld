@@ -1,5 +1,11 @@
-#!/usr/bin/env python3
+# from pyvirtualdisplay import Display
 
+# display = Display(visible=0, size=(800, 600))
+# display.start()
+
+import os
+# os.environ.pop("PYGLET_HEADLESS", None)
+# os.environ.pop("MINIWORLD_HEADLESS", None)
 import numpy as np
 import gymnasium as gym
 import matplotlib.pyplot as plt
@@ -11,9 +17,26 @@ from tqdm import tqdm
 from PIL import Image
 import argparse
 import miniworld
+import sys
+from contextlib import contextmanager
 
 from worldmodel import WorldModel
 from MCTS import MCTS
+
+
+@contextmanager
+def suppress_output():
+    """Context manager to suppress stdout and stderr."""
+    with open(os.devnull, 'w') as devnull:
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        sys.stdout = devnull
+        sys.stderr = devnull
+        try:
+            yield
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
 
 
 def get_config():
@@ -501,7 +524,8 @@ def train_world_model_warmup(model, optimizer, replay_buffer, device, config):
     for step in tqdm(range(config['num_training_steps']), desc="Training"):
         # Collect new data periodically
         if step % config['collect_every_n_steps'] == 0 and step > 0:
-            env_base = gym.make(config['env_name'], render_mode='rgb_array')
+            with suppress_output():
+                env_base = gym.make(config['env_name'], render_mode='rgb_array')
             env = ShapedRewardWrapper(env_base, shaping_scale=0.1, goal_bonus=10.0, near_goal_threshold=0.8)
             trajectory, _, _ = collect_trajectory(env, heuristic_policy, config, max_steps=500)
             replay_buffer.add_trajectory(trajectory)
@@ -859,7 +883,8 @@ def main():
     
     # Initialize environment
     print("\nInitializing environment...")
-    env_base = gym.make(config['env_name'], render_mode='rgb_array')
+    with suppress_output():
+        env_base = gym.make(config['env_name'], render_mode='rgb_array')
     env = ShapedRewardWrapper(
         env_base,
         shaping_scale=0.1,
