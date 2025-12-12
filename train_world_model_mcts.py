@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""
-World Model Training with MCTS
-Converted from world_model_complete.ipynb
-
-This script trains a world model on the MiniWorld environment and then
-uses MCTS for planning and policy improvement.
-"""
 
 import numpy as np
 import gymnasium as gym
@@ -17,8 +10,8 @@ import torch.optim as optim
 from tqdm import tqdm
 from PIL import Image
 import argparse
+import miniworld
 
-# Import models from local modules
 from worldmodel import WorldModel
 from MCTS import MCTS
 
