@@ -75,6 +75,12 @@ def get_config():
         # Exploration
         'epsilon': 0.3,
         
+        # Reward shaping
+        'use_reward_shaping': True,
+        'shaping_scale': 0.1,
+        'goal_bonus': 10.0,
+        'near_goal_threshold': 0.8,
+        
         # MCTS parameters
         'num_simulations': 50,
         'c_puct': 1.0,
@@ -606,7 +612,12 @@ def train_world_model_warmup(model, optimizer, replay_buffer, device, config):
         if step % config['collect_every_n_steps'] == 0 and step > 0:
             with suppress_output():
                 env_base = gym.make(config['env_name'], render_mode='rgb_array')
-            env = ShapedRewardWrapper(env_base, shaping_scale=0.1, goal_bonus=10.0, near_goal_threshold=0.8)
+            env = ShapedRewardWrapper(
+                env_base,
+                shaping_scale=config['shaping_scale'],
+                goal_bonus=config['goal_bonus'],
+                near_goal_threshold=config['near_goal_threshold']
+            ) if config['use_reward_shaping'] else env_base
             trajectory, _, _ = collect_trajectory(env, heuristic_policy, config, max_steps=500)
             replay_buffer.add_trajectory(trajectory)
             env.close()
@@ -1169,13 +1180,16 @@ def main():
         env_base = gym.make(config['env_name'], render_mode='rgb_array')
     env_warmup = ShapedRewardWrapper(
         env_base,
-        shaping_scale=0.1,
-        goal_bonus=10.0,
-        near_goal_threshold=0.8
-    )
+        shaping_scale=config['shaping_scale'],
+        goal_bonus=config['goal_bonus'],
+        near_goal_threshold=config['near_goal_threshold']
+    ) if config['use_reward_shaping'] else env_base
     print(f"Environment: {config['env_name']}")
     print(f"Action space: {env_warmup.action_space}")
-    print("Using reward shaping for warmup phase")
+    if config['use_reward_shaping']:
+        print(f"Using reward shaping for warmup (scale={config['shaping_scale']}, bonus={config['goal_bonus']})")
+    else:
+        print("Using raw rewards (no shaping) for warmup phase")
     
     # Initialize world model
     print("\nInitializing world model...")
@@ -1317,11 +1331,21 @@ def main():
     print("Phase 3: MCTS Training")
     print("="*60)
     
-    # Create new environment WITHOUT reward shaping for MCTS
-    print("Creating new environment without reward shaping for MCTS...")
+    # Create new environment WITH reward shaping for MCTS
+    print("Creating new environment for MCTS...")
     with suppress_output():
-        env_mcts = gym.make(config['env_name'], render_mode='rgb_array')
-    print("Using raw rewards (no shaping) for MCTS phase")
+        env_mcts_base = gym.make(config['env_name'], render_mode='rgb_array')
+    env_mcts = ShapedRewardWrapper(
+        env_mcts_base,
+        shaping_scale=config['shaping_scale'],
+        goal_bonus=config['goal_bonus'],
+        near_goal_threshold=config['near_goal_threshold']
+    ) if config['use_reward_shaping'] else env_mcts_base
+    
+    if config['use_reward_shaping']:
+        print(f"Using reward shaping for MCTS (scale={config['shaping_scale']}, bonus={config['goal_bonus']})")
+    else:
+        print("Using raw rewards (no shaping) for MCTS phase")
     
     # Close warmup environment if it exists
     if 'env_warmup' in locals():
