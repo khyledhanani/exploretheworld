@@ -590,7 +590,7 @@ def plot_warmup_losses(losses_history, save_path='warmup_losses.png'):
     plt.close()
 
 
-def train_world_model_warmup(model, optimizer, replay_buffer, device, config):
+def train_world_model_warmup(model, optimizer, replay_buffer, env, device, config):
     """Warm-up training phase: train world model on heuristic data."""
     model.train()
     losses_history = {
@@ -608,19 +608,10 @@ def train_world_model_warmup(model, optimizer, replay_buffer, device, config):
     print("Starting warm-up training...")
     
     for step in tqdm(range(config['num_training_steps']), desc="Training"):
-        # Collect new data periodically
+        # Collect new data periodically using the passed environment
         if step % config['collect_every_n_steps'] == 0 and step > 0:
-            with suppress_output():
-                env_base = gym.make(config['env_name'], render_mode='rgb_array')
-            env = ShapedRewardWrapper(
-                env_base,
-                shaping_scale=config['shaping_scale'],
-                goal_bonus=config['goal_bonus'],
-                near_goal_threshold=config['near_goal_threshold']
-            ) if config['use_reward_shaping'] else env_base
             trajectory, _, _ = collect_trajectory(env, heuristic_policy, config, max_steps=500)
             replay_buffer.add_trajectory(trajectory)
-            env.close()
         
         # KL annealing
         if step < config['kl_anneal_steps']:
@@ -1289,7 +1280,7 @@ def main():
         print("="*60)
         
         losses_history = train_world_model_warmup(
-            model, optimizer, replay_buffer, device, config
+            model, optimizer, replay_buffer, env_warmup, device, config
         )
         
         print("\nTraining complete!")
