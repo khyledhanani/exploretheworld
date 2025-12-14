@@ -50,7 +50,7 @@ def get_config():
         'stochastic_dim': 64,
         
         # Training hyperparameters
-        'batch_size': 16,
+        'batch_size': 32,
         'seq_length': 16,
         'learning_rate': 3e-4,
         'num_collection_episodes': 100,
@@ -138,7 +138,24 @@ class ReplayBuffer:
             return None
         
         max_start = len(self.buffer) - seq_length
-        starts = np.random.randint(0, max_start, size=batch_size)
+
+        valid_starts = []
+        attempts = 0
+        max_attempts = max(200, batch_size * 50)
+        while len(valid_starts) < batch_size and attempts < max_attempts:
+            s = int(np.random.randint(0, max_start))
+            # Disallow a terminal in the middle of the sequence (allow at last step).
+            crosses = any(float(self.buffer[s + i]['done']) > 0.5 for i in range(seq_length - 1))
+            if not crosses:
+                valid_starts.append(s)
+            attempts += 1
+
+        if len(valid_starts) < batch_size:
+            # Fill remainder with random (state-reset logic in training will handle).
+            filler = np.random.randint(0, max_start, size=(batch_size - len(valid_starts)))
+            starts = np.array(valid_starts + list(filler), dtype=np.int64)
+        else:
+            starts = np.array(valid_starts, dtype=np.int64)
         
         obs_seq = []
         action_seq = []
@@ -202,7 +219,22 @@ class MCTSReplayBuffer:
             return None
         
         max_start = len(self.buffer) - seq_length
-        starts = np.random.randint(0, max_start, size=batch_size)
+
+        valid_starts = []
+        attempts = 0
+        max_attempts = max(200, batch_size * 50)
+        while len(valid_starts) < batch_size and attempts < max_attempts:
+            s = int(np.random.randint(0, max_start))
+            crosses = any(float(self.buffer[s + i]['done']) > 0.5 for i in range(seq_length - 1))
+            if not crosses:
+                valid_starts.append(s)
+            attempts += 1
+
+        if len(valid_starts) < batch_size:
+            filler = np.random.randint(0, max_start, size=(batch_size - len(valid_starts)))
+            starts = np.array(valid_starts + list(filler), dtype=np.int64)
+        else:
+            starts = np.array(valid_starts, dtype=np.int64)
         
         obs_seq = []
         action_seq = []
@@ -654,7 +686,12 @@ def train_world_model_warmup(model, optimizer, replay_buffer, env, device, confi
             if t == 0:
                 action_prev = torch.zeros(B, config['action_dim'], device=device)
             else:
-                action_prev = action_seq[:, t-1]
+                done_prev = done_seq[:, t - 1].unsqueeze(-1)  # (B, 1)
+                if h_prev is not None:
+                    h_prev = h_prev * (1.0 - done_prev)
+                if z_prev is not None:
+                    z_prev = z_prev * (1.0 - done_prev)
+                action_prev = action_seq[:, t - 1] * (1.0 - done_prev)
             
             outputs = model(obs_t, action_prev, h_prev, z_prev, use_posterior=True)
             all_outputs.append(outputs)
@@ -697,12 +734,12 @@ def train_world_model_warmup(model, optimizer, replay_buffer, env, device, confi
                     all_outputs[t]['post_dist'],
                     all_outputs[t]['prior_dist']
                 )
-                
-                kl_t_raw = kl_per_dim.mean()
+
+                kl_per_sample = kl_per_dim.sum(dim=-1)  # (B,)
+                kl_t_raw = kl_per_sample.mean()
                 kl_loss_raw += kl_t_raw
-                
-                kl_per_dim_clamped = torch.clamp(kl_per_dim - config['free_nats'], min=0.0)
-                kl_t = kl_per_dim_clamped.mean()
+
+                kl_t = torch.clamp(kl_per_sample - config['free_nats'], min=0.0).mean()
                 kl_loss += kl_t
                 
                 posterior_stds.append(all_outputs[t]['post_dist'].stddev.mean().item())
@@ -775,7 +812,16 @@ def muzero_training_step(model, optimizer, batch, device, config, step):
     
     for t in range(T):
         obs_t = obs_seq[:, t]
-        action_prev = torch.zeros(B, config['action_dim'], device=device) if t == 0 else action_seq[:, t-1]
+        if t == 0:
+            action_prev = torch.zeros(B, config['action_dim'], device=device)
+        else:
+            # Reset RSSM state on episode boundaries inside the batch.
+            done_prev = done_seq[:, t - 1].unsqueeze(-1)  # (B, 1)
+            if h_prev is not None:
+                h_prev = h_prev * (1.0 - done_prev)
+            if z_prev is not None:
+                z_prev = z_prev * (1.0 - done_prev)
+            action_prev = action_seq[:, t - 1] * (1.0 - done_prev)
         
         outputs = model(obs_t, action_prev, h_prev, z_prev, use_posterior=True)
         all_outputs.append(outputs)
@@ -801,8 +847,8 @@ def muzero_training_step(model, optimizer, batch, device, config, step):
                 all_outputs[t]['post_dist'],
                 all_outputs[t]['prior_dist']
             )
-            kl_per_dim_clamped = torch.clamp(kl_per_dim - config['free_nats'], min=0.0)
-            kl_loss += kl_per_dim_clamped.mean()
+            kl_per_sample = kl_per_dim.sum(dim=-1)  # (B,)
+            kl_loss += torch.clamp(kl_per_sample - config['free_nats'], min=0.0).mean()
     kl_loss = kl_loss / T
     
     # Value loss with MCTS value targets when available (per-timestep)

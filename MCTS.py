@@ -159,11 +159,11 @@ def MCTS(world_model, root_h, root_z, c_puct, num_simulations, discount, action_
 
         policy_probs = policy_probs.squeeze(0).detach()
         
-        # Add Dirichlet noise to root priors for exploration
-        dirichlet = torch.distributions.Dirichlet(
-            torch.full((action_space_size,), float(dirichlet_alpha), device=root_h.device, dtype=torch.float32)
-        )
-        noise = dirichlet.sample()
+        # Add Dirichlet noise to root priors for exploration.
+        # NOTE: torch's Dirichlet sampling is not implemented on MPS in some PyTorch builds,
+        # so we sample with NumPy and move to the model device.
+        noise_np = np.random.dirichlet([float(dirichlet_alpha)] * int(action_space_size)).astype(np.float32)
+        noise = torch.tensor(noise_np, device=root_h.device, dtype=torch.float32)
         policy_probs = 0.75 * policy_probs + 0.25 * noise
         s = policy_probs.sum()
         if torch.isfinite(s) and float(s.item()) > 0:
