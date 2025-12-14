@@ -54,7 +54,7 @@ def get_config():
         'seq_length': 16,
         'learning_rate': 3e-4,
         'num_collection_episodes': 100,
-        'num_training_steps': 10000,
+        'num_training_steps': 5000,
         'collect_every_n_steps': 50,
         
         # Loss weights
@@ -210,7 +210,7 @@ class MCTSReplayBuffer:
         done_seq = []
         policy_target_seq = []
         value_target_seq = []
-        has_mcts_targets = []
+        has_mcts_targets = []  
         
         for start in starts:
             seq = [self.buffer[start + i] for i in range(seq_length)]
@@ -222,16 +222,20 @@ class MCTSReplayBuffer:
             
             policy_targets = [s['policy_target'] for s in seq]
             value_targets = [s['value_target'] for s in seq]
-            
-            has_targets = all(p is not None for p in policy_targets)
-            has_mcts_targets.append(has_targets)
-            
-            if has_targets:
-                policy_target_seq.append(policy_targets)
-                value_target_seq.append(value_targets)
-            else:
-                policy_target_seq.append([np.ones(action_dim) / action_dim for _ in seq])
-                value_target_seq.append([0.0 for _ in seq])
+
+            timestep_has = [p is not None for p in policy_targets]
+            has_mcts_targets.append(timestep_has)
+
+            filled_policy = [
+                (p if p is not None else (np.ones(action_dim, dtype=np.float32) / action_dim))
+                for p in policy_targets
+            ]
+            filled_value = [
+                (v if v is not None else 0.0)
+                for v in value_targets
+            ]
+            policy_target_seq.append(filled_policy)
+            value_target_seq.append(filled_value)
         
         # Convert to tensors
         obs_tensor = torch.stack([
@@ -753,7 +757,7 @@ def muzero_training_step(model, optimizer, batch, device, config, step):
     done_seq = batch['done'].to(device)
     policy_target = batch['policy_target'].to(device)
     value_target = batch['value_target'].to(device)
-    has_mcts = batch['has_mcts_targets']
+    has_mcts = batch['has_mcts_targets'].to(device)
     
     B, T = obs_seq.shape[:2]
     
@@ -801,21 +805,15 @@ def muzero_training_step(model, optimizer, batch, device, config, step):
             kl_loss += kl_per_dim_clamped.mean()
     kl_loss = kl_loss / T
     
-    # Value loss with MCTS value targets when available
+    # Value loss with MCTS value targets when available (per-timestep)
     with torch.no_grad():
         # Compute n-step returns as baseline
         n_step_returns = compute_n_step_returns(
             reward_seq, done_seq, v_hat_seq.detach(),
             gamma=config['gamma'], n_step=config['n_step']
         )
-        
-        # Use MCTS value targets when available, otherwise use n-step returns
-        value_targets = n_step_returns.clone()
-        if has_mcts.any():
-            # Replace n-step returns with MCTS value estimates for trajectories that have them
-            for b_idx in range(B):
-                if has_mcts[b_idx]:
-                    value_targets[b_idx] = value_target[b_idx]
+
+        value_targets = torch.where(has_mcts, value_target, n_step_returns)
     
     # Use Huber loss for more robust value learning with sparse rewards
     if config.get('use_huber_value_loss', False):
@@ -826,11 +824,10 @@ def muzero_training_step(model, optimizer, batch, device, config, step):
     # Policy distillation loss
     policy_loss = torch.tensor(0.0, device=device)
     if has_mcts.any():
-        policy_logits_flat = policy_logits_seq.view(-1, config['action_dim'])
-        policy_target_flat = policy_target.view(-1, config['action_dim'])
-        
-        mask = has_mcts.unsqueeze(1).expand(-1, T).reshape(-1).to(device)
-        
+        policy_logits_flat = policy_logits_seq.reshape(-1, config['action_dim'])
+        policy_target_flat = policy_target.reshape(-1, config['action_dim'])
+        mask = has_mcts.reshape(-1)
+
         if mask.sum() > 0:
             log_probs = F.log_softmax(policy_logits_flat[mask], dim=-1)
             policy_loss = -(policy_target_flat[mask] * log_probs).sum(dim=-1).mean()
