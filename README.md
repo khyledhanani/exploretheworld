@@ -1,2 +1,2 @@
 # rep_learning
-(deep?) representation learning sandbox
+used to just be a latent mcts agent but now this is my sandbox for rl exploratino (focussing on sparse reward envs)
