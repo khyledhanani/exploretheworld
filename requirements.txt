@@ -1,0 +1,23 @@
+# Core RL libraries
+stable-baselines3>=2.2.0
+sb3-contrib>=2.2.0
+
+# Environment
+gymnasium>=0.29.0
+miniworld>=2.0.0
+
+# Deep learning
+torch>=2.0.0
+numpy>=1.24.0
+
+# Visualization and logging
+tensorboard>=2.14.0
+matplotlib>=3.7.0
+tqdm>=4.65.0
+
+# Video recording
+imageio>=2.31.0
+imageio-ffmpeg>=0.4.8
+
+# Utilities
+pyyaml>=6.0
