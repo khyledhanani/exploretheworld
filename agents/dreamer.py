@@ -28,6 +28,7 @@ from tqdm import tqdm
 
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils.wandb_utils import init_wandb, log_wandb, finish_wandb
 
 
 @dataclass
@@ -81,6 +82,13 @@ class DreamerConfig:
     log_dir: str = "logs/dreamer"
     save_freq: int = 50000
     eval_freq: int = 10000
+    wandb_enabled: bool = True
+    wandb_project: str = "worldmodels"
+    wandb_entity: Optional[str] = None
+    wandb_group: Optional[str] = None
+    wandb_tags: Optional[List[str]] = None
+    wandb_run_name: Optional[str] = None
+    wandb_mode: str = "online"
 
 
 class ConvEncoder(nn.Module):
@@ -711,6 +719,7 @@ def train_dreamer(config: Optional[DreamerConfig] = None) -> DreamerAgent:
 
     os.makedirs(config.log_dir, exist_ok=True)
     writer = SummaryWriter(config.log_dir)
+    run = init_wandb(config, "dreamer", log_dir=config.log_dir)
 
     # Create environment
     env = gym.make(config.env_id)
@@ -732,91 +741,105 @@ def train_dreamer(config: Optional[DreamerConfig] = None) -> DreamerAgent:
     agent = DreamerAgent(config, obs_shape, action_size)
     buffer = ReplayBuffer(config.buffer_size, obs_shape, action_size)
 
-    # Prefill buffer with random actions
-    print("Prefilling replay buffer...")
-    obs, _ = env.reset(seed=config.seed)
-    for _ in tqdm(range(config.prefill_steps)):
-        action = env.action_space.sample()
-        next_obs, reward, terminated, truncated, info = env.step(action)
-        done = terminated or truncated
+    try:
+        # Prefill buffer with random actions
+        print("Prefilling replay buffer...")
+        obs, _ = env.reset(seed=config.seed)
+        for _ in tqdm(range(config.prefill_steps)):
+            action = env.action_space.sample()
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
 
-        # Transpose observation to channels-first
-        obs_transposed = np.transpose(obs, (2, 0, 1))
-        buffer.add(obs_transposed, action, reward + config.time_penalty, done)
+            # Transpose observation to channels-first
+            obs_transposed = np.transpose(obs, (2, 0, 1))
+            buffer.add(obs_transposed, action, reward + config.time_penalty, done)
 
-        if done:
-            obs, _ = env.reset()
-        else:
-            obs = next_obs
+            if done:
+                obs, _ = env.reset()
+            else:
+                obs = next_obs
 
-    # Training loop
-    print("\nStarting training...")
-    obs, _ = env.reset()
-    agent.reset()
+        # Training loop
+        print("\nStarting training...")
+        obs, _ = env.reset()
+        agent.reset()
 
-    episode_reward = 0
-    episode_length = 0
-    episode_count = 0
-    episode_rewards = []
+        episode_reward = 0
+        episode_length = 0
+        episode_count = 0
+        episode_rewards = []
 
-    for step in tqdm(range(config.total_steps)):
-        # Act in environment
-        obs_transposed = np.transpose(obs, (2, 0, 1))
-        action = agent.act(obs_transposed, training=True)
+        for step in tqdm(range(config.total_steps)):
+            # Act in environment
+            obs_transposed = np.transpose(obs, (2, 0, 1))
+            action = agent.act(obs_transposed, training=True)
 
-        next_obs, reward, terminated, truncated, info = env.step(action)
-        done = terminated or truncated
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
 
-        buffer.add(obs_transposed, action, reward + config.time_penalty, done)
+            buffer.add(obs_transposed, action, reward + config.time_penalty, done)
 
-        episode_reward += reward
-        episode_length += 1
+            episode_reward += reward
+            episode_length += 1
 
-        if done:
-            episode_rewards.append(episode_reward)
-            writer.add_scalar("train/episode_reward", episode_reward, step)
-            writer.add_scalar("train/episode_length", episode_length, step)
-            episode_count += 1
+            if done:
+                episode_rewards.append(episode_reward)
+                writer.add_scalar("train/episode_reward", episode_reward, step)
+                writer.add_scalar("train/episode_length", episode_length, step)
+                log_wandb(
+                    run,
+                    {
+                        "train/episode_reward": episode_reward,
+                        "train/episode_length": episode_length,
+                        "train/episode_count": episode_count + 1,
+                    },
+                    step=step,
+                )
+                episode_count += 1
 
-            obs, _ = env.reset()
-            agent.reset()
-            episode_reward = 0
-            episode_length = 0
-        else:
-            obs = next_obs
+                obs, _ = env.reset()
+                agent.reset()
+                episode_reward = 0
+                episode_length = 0
+            else:
+                obs = next_obs
 
-        # Train
-        if step % config.train_every == 0 and buffer.size > config.batch_size * config.batch_length:
-            for _ in range(config.train_steps):
-                batch = buffer.sample(config.batch_size, config.batch_length)
+            # Train
+            if step % config.train_every == 0 and buffer.size > config.batch_size * config.batch_length:
+                for _ in range(config.train_steps):
+                    batch = buffer.sample(config.batch_size, config.batch_length)
 
-                # Train world model
-                world_metrics = agent.train_world_model(batch)
+                    # Train world model
+                    world_metrics = agent.train_world_model(batch)
 
-                # Train actor-critic
-                ac_metrics = agent.train_actor_critic(batch)
+                    # Train actor-critic
+                    ac_metrics = agent.train_actor_critic(batch)
 
-            # Log metrics
-            for k, v in {**world_metrics, **ac_metrics}.items():
-                writer.add_scalar(k, v, step)
+                # Log metrics
+                combined_metrics = {**world_metrics, **ac_metrics}
+                for k, v in combined_metrics.items():
+                    writer.add_scalar(k, v, step)
+                log_wandb(run, combined_metrics, step=step)
 
-        # Evaluate
-        if step % config.eval_freq == 0 and step > 0:
-            eval_rewards = evaluate_dreamer(agent, config.env_id, n_episodes=10)
-            mean_reward = np.mean(eval_rewards)
-            writer.add_scalar("eval/mean_reward", mean_reward, step)
-            print(f"\nStep {step}: Eval mean reward = {mean_reward:.2f}")
+            # Evaluate
+            if step % config.eval_freq == 0 and step > 0:
+                eval_rewards = evaluate_dreamer(agent, config.env_id, n_episodes=10)
+                mean_reward = np.mean(eval_rewards)
+                writer.add_scalar("eval/mean_reward", mean_reward, step)
+                log_wandb(run, {"eval/mean_reward": mean_reward}, step=step)
+                print(f"\nStep {step}: Eval mean reward = {mean_reward:.2f}")
 
-        # Save
-        if step % config.save_freq == 0 and step > 0:
-            agent.save(os.path.join(config.log_dir, f"dreamer_{step}.pt"))
+            # Save
+            if step % config.save_freq == 0 and step > 0:
+                agent.save(os.path.join(config.log_dir, f"dreamer_{step}.pt"))
 
-    # Save final model
-    agent.save(os.path.join(config.log_dir, "dreamer_final.pt"))
-    print(f"Model saved to {config.log_dir}/dreamer_final.pt")
-
-    env.close()
-    writer.close()
+        # Save final model
+        agent.save(os.path.join(config.log_dir, "dreamer_final.pt"))
+        print(f"Model saved to {config.log_dir}/dreamer_final.pt")
+    finally:
+        env.close()
+        writer.close()
+        finish_wandb(run)
 
     return agent
 

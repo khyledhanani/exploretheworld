@@ -7,6 +7,7 @@ Usage:
     python train.py recurrent --env MiniWorld-OneRoom-v0 --timesteps 500000
     python train.py qrdqn --env MiniWorld-OneRoom-v0 --timesteps 500000
     python train.py rnd --env MiniWorld-OneRoom-v0 --timesteps 1000000
+    python train.py recurrent_rnd --env MiniWorld-OneRoom-v0 --timesteps 2000000
     python train.py dreamer --env MiniWorld-OneRoom-v0 --steps 500000
 """
 
@@ -29,6 +30,7 @@ Examples:
   python train.py recurrent --lstm-hidden 512
   python train.py qrdqn --buffer-size 200000
   python train.py rnd --intrinsic-coef 0.2
+  python train.py recurrent_rnd --lstm-hidden 512 --intrinsic-coef 0.5
   python train.py dreamer --steps 500000
   python train.py ppo --eval logs/ppo_cnn/ppo_cnn_final.zip
         """
@@ -52,6 +54,15 @@ Examples:
         # Add common arguments
         for arg_name, arg_type, default, help_text in common_args:
             subparser.add_argument(arg_name, type=arg_type, default=default, help=help_text)
+
+        # Weights & Biases logging
+        subparser.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases logging")
+        subparser.add_argument("--wandb-project", type=str, default="worldmodels", help="Wandb project name")
+        subparser.add_argument("--wandb-entity", type=str, default=None, help="Wandb entity/team")
+        subparser.add_argument("--wandb-group", type=str, default=None, help="Wandb group name")
+        subparser.add_argument("--wandb-tags", type=str, default=None, help="Comma-separated wandb tags")
+        subparser.add_argument("--wandb-run-name", type=str, default=None, help="Wandb run name")
+        subparser.add_argument("--wandb-mode", type=str, default="online", help="Wandb mode: online/offline/disabled")
 
         # Add timesteps argument (different name for dreamer)
         if agent_name == "dreamer":
@@ -126,6 +137,26 @@ def train_agent(agent_name: str, args):
         elif agent_name == "rnd":
             config_kwargs["n_envs"] = args.n_envs
             config_kwargs["intrinsic_reward_coef"] = args.intrinsic_coef
+        elif agent_name == "recurrent_rnd":
+            config_kwargs["n_envs"] = args.n_envs
+            config_kwargs["lstm_hidden_size"] = args.lstm_hidden
+            config_kwargs["intrinsic_reward_coef"] = args.intrinsic_coef
+
+        wandb_tags = None
+        if getattr(args, "wandb_tags", None):
+            wandb_tags = [
+                tag.strip() for tag in args.wandb_tags.split(",") if tag.strip()
+            ]
+
+        config_kwargs.update({
+            "wandb_enabled": not getattr(args, "no_wandb", False),
+            "wandb_project": getattr(args, "wandb_project", "worldmodels"),
+            "wandb_entity": getattr(args, "wandb_entity", None),
+            "wandb_group": getattr(args, "wandb_group", None),
+            "wandb_tags": wandb_tags,
+            "wandb_run_name": getattr(args, "wandb_run_name", None),
+            "wandb_mode": getattr(args, "wandb_mode", "online"),
+        })
 
         config = config_class(**config_kwargs)
         train_func(config)

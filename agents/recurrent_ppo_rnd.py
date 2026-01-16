@@ -1,4 +1,12 @@
 """
+RecurrentPPO + RND Agent
+
+Combines:
+- RecurrentPPO (LSTM) for handling partial observability and temporal dependencies
+- RND (Random Network Distillation) for curiosity-driven exploration
+
+Best for: Sparse reward environments where the agent needs both memory
+(to track where it's been) and exploration incentives (to discover new areas).
 """
 
 import os
@@ -9,7 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from stable_baselines3 import PPO
+from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
 from stable_baselines3.common.vec_env import VecEnv, VecEnvWrapper
 from stable_baselines3.common.running_mean_std import RunningMeanStd
@@ -24,22 +32,25 @@ import miniworld
 
 
 @dataclass
-class PPORNDConfig:
-    """Configuration for PPO + RND agent."""
+class RecurrentPPORNDConfig:
+    """Configuration for RecurrentPPO + RND agent."""
 
     # Environment
     env_id: str = "MiniWorld-OneRoom-v0"
     n_envs: int = 8
-    frame_stack: int = 4
-    # No time penalty - RND provides exploration
+    # LSTM handles temporal info, minimal frame stacking needed
+    frame_stack: int = 1
+    # No time penalty - RND provides exploration incentive
     time_penalty: float = 0.0
 
+    # Feature extractor: "cnn", "vit", "vit_small"
     extractor: str = "cnn"
     features_dim: int = 256
 
-    learning_rate: float = 3e-4
+    # RecurrentPPO hyperparameters
+    learning_rate: float = 2.5e-4
     n_steps: int = 128
-    batch_size: int = 256
+    batch_size: int = 64
     n_epochs: int = 4
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -48,24 +59,31 @@ class PPORNDConfig:
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
 
+    # LSTM configuration
+    lstm_hidden_size: int = 256
+    n_lstm_layers: int = 1
+    shared_lstm: bool = True
+    enable_critic_lstm: bool = False
+
+    # RND configuration
     rnd_lr: float = 1e-4
     rnd_output_dim: int = 512
     intrinsic_reward_coef: float = 1.0
-    intrinsic_reward_coef_min: float = 0.01  # Minimum coefficient after decay
-    intrinsic_decay_rate: float = 0.99995  # Per-step decay (0.99995^100k ≈ 0.007)
+    intrinsic_reward_coef_min: float = 0.01
+    intrinsic_decay_rate: float = 0.99995
     intrinsic_gamma: float = 0.99
     normalize_intrinsic: bool = True
     update_proportion: float = 0.25
 
     # Network architecture
-    net_arch: tuple = (256, 256)
+    net_arch: tuple = (256,)
 
     # Training
-    # RND needs more steps
     total_timesteps: int = 2_000_000
     seed: int = 42
 
-    log_dir: str = "logs/ppo_rnd"
+    # Logging
+    log_dir: str = "logs/recurrent_ppo_rnd"
     save_freq: int = 50000
     wandb_enabled: bool = True
     wandb_project: str = "worldmodels"
@@ -179,7 +197,7 @@ class RNDRewardWrapper(VecEnvWrapper):
         self.decay_rate = decay_rate
         self.normalize_intrinsic = normalize_intrinsic
         self.gamma = gamma
-        
+
         # Track steps for decay
         self.total_steps = 0
         self._current_coef = intrinsic_coef
@@ -230,8 +248,8 @@ class RNDRewardWrapper(VecEnvWrapper):
         return obs, combined_rewards, dones, infos
 
 
-class RNDCallback(BaseCallback):
-    """Callback to train RND predictor network during PPO training."""
+class RecurrentRNDCallback(BaseCallback):
+    """Callback to train RND predictor network during RecurrentPPO training."""
 
     def __init__(
         self,
@@ -279,11 +297,11 @@ class RNDCallback(BaseCallback):
         if self.n_calls % 1000 == 0 and len(self.intrinsic_rewards) > 0:
             mean_intrinsic = np.mean(self.intrinsic_rewards[-1000:])
             self.logger.record("rnd/mean_intrinsic_reward", mean_intrinsic)
-            
+
             # Log current coefficient
             if current_coef is not None:
                 self.logger.record("rnd/intrinsic_coef", current_coef)
-            
+
             # Also log directly to wandb
             wandb = self._get_wandb()
             if wandb is not None:
@@ -299,20 +317,30 @@ class RNDCallback(BaseCallback):
         return True
 
     def _on_rollout_end(self) -> None:
-        """Train RND on collected rollout data."""
+        """Train RND on collected rollout data from RecurrentRolloutBuffer."""
         rollout_buffer = self.model.rollout_buffer
 
+        # RecurrentRolloutBuffer stores observations with shape:
+        # (buffer_size, n_seq, *obs_shape) where n_seq is the sequence length
+        # We need to flatten and sample from these
+        obs = rollout_buffer.observations
+
+        # Flatten all dimensions except observation shape
+        # Original shape: (buffer_size, n_seq, *obs_shape)
+        original_shape = obs.shape
+        obs_shape = original_shape[2:]  # Get the actual observation dimensions
+        total_samples = original_shape[0] * original_shape[1]
+        obs_flat = obs.reshape(total_samples, *obs_shape)
+
         # Sample subset of observations
-        n_samples = int(rollout_buffer.buffer_size * rollout_buffer.n_envs * self.update_proportion)
+        n_samples = int(total_samples * self.update_proportion)
         indices = np.random.choice(
-            rollout_buffer.buffer_size * rollout_buffer.n_envs,
-            size=min(n_samples, rollout_buffer.buffer_size * rollout_buffer.n_envs),
+            total_samples,
+            size=min(n_samples, total_samples),
             replace=False
         )
 
-        # Get observations
-        obs = rollout_buffer.observations.reshape(-1, *rollout_buffer.observations.shape[2:])
-        obs_sample = obs[indices]
+        obs_sample = obs_flat[indices]
 
         # Train RND predictor
         obs_tensor = torch.FloatTensor(obs_sample).to(self.rnd.device)
@@ -324,7 +352,7 @@ class RNDCallback(BaseCallback):
         self.optimizer.step()
 
         self.logger.record("rnd/predictor_loss", loss.item())
-        
+
         # Also log directly to wandb
         wandb = self._get_wandb()
         if wandb is not None:
@@ -333,8 +361,10 @@ class RNDCallback(BaseCallback):
             }, step=self.num_timesteps)
 
 
-def create_ppo_rnd_agent(config: PPORNDConfig) -> Tuple[PPO, RNDNetwork, RNDRewardWrapper]:
-    """Create PPO + RND agent with specified configuration."""
+def create_recurrent_ppo_rnd_agent(
+    config: RecurrentPPORNDConfig
+) -> Tuple[RecurrentPPO, RNDNetwork, RNDRewardWrapper]:
+    """Create RecurrentPPO + RND agent with specified configuration."""
 
     # Create base vectorized environment with random seeds per episode
     base_env = make_vec_env(
@@ -363,17 +393,26 @@ def create_ppo_rnd_agent(config: PPORNDConfig) -> Tuple[PPO, RNDNetwork, RNDRewa
         gamma=config.intrinsic_gamma,
     )
 
-    # Policy kwargs with configurable feature extractor
+    # sb3-contrib constraint: shared LSTM requires enable_critic_lstm=False
+    enable_critic_lstm = config.enable_critic_lstm
+    if config.shared_lstm and enable_critic_lstm:
+        enable_critic_lstm = False
+
+    # Policy kwargs with configurable extractor and LSTM config
     extractor_class = get_extractor(config.extractor)
     policy_kwargs = dict(
         features_extractor_class=extractor_class,
         features_extractor_kwargs=dict(features_dim=config.features_dim),
+        lstm_hidden_size=config.lstm_hidden_size,
+        n_lstm_layers=config.n_lstm_layers,
+        shared_lstm=config.shared_lstm,
+        enable_critic_lstm=enable_critic_lstm,
         net_arch=dict(pi=list(config.net_arch), vf=list(config.net_arch)),
     )
 
-    # Create PPO agent
-    model = PPO(
-        policy="CnnPolicy",
+    # Create RecurrentPPO agent
+    model = RecurrentPPO(
+        policy="CnnLstmPolicy",
         env=rnd_wrapper,
         learning_rate=config.learning_rate,
         n_steps=config.n_steps,
@@ -394,31 +433,34 @@ def create_ppo_rnd_agent(config: PPORNDConfig) -> Tuple[PPO, RNDNetwork, RNDRewa
     return model, rnd_network, rnd_wrapper
 
 
-def train_ppo_rnd(config: Optional[PPORNDConfig] = None) -> Tuple[PPO, RNDNetwork]:
-    """Train PPO + RND agent."""
+def train_recurrent_ppo_rnd(
+    config: Optional[RecurrentPPORNDConfig] = None
+) -> Tuple[RecurrentPPO, RNDNetwork]:
+    """Train RecurrentPPO + RND agent."""
 
     if config is None:
-        config = PPORNDConfig()
+        config = RecurrentPPORNDConfig()
 
     os.makedirs(config.log_dir, exist_ok=True)
 
     print("=" * 60)
-    print("PPO + RND (Curiosity-Driven) Training")
+    print("RecurrentPPO + RND (LSTM + Curiosity) Training")
     print("=" * 60)
     print(f"Environment: {config.env_id}")
     print(f"Extractor: {config.extractor} (features_dim={config.features_dim})")
     print(f"Parallel envs: {config.n_envs}")
+    print(f"LSTM hidden size: {config.lstm_hidden_size}")
     print(f"Intrinsic reward: {config.intrinsic_reward_coef} -> {config.intrinsic_reward_coef_min} (decay={config.intrinsic_decay_rate})")
     print(f"Total timesteps: {config.total_timesteps:,}")
     print("=" * 60)
 
-    run = init_wandb(config, "ppo_rnd", log_dir=config.log_dir)
-    model, rnd_network, rnd_wrapper = create_ppo_rnd_agent(config)
+    run = init_wandb(config, "recurrent_ppo_rnd", log_dir=config.log_dir)
+    model, rnd_network, rnd_wrapper = create_recurrent_ppo_rnd_agent(config)
 
     # Setup callbacks
     callbacks = [
         MetricsCallback(verbose=1),
-        RNDCallback(
+        RecurrentRNDCallback(
             rnd_network=rnd_network,
             rnd_wrapper=rnd_wrapper,
             learning_rate=config.rnd_lr,
@@ -428,7 +470,7 @@ def train_ppo_rnd(config: Optional[PPORNDConfig] = None) -> Tuple[PPO, RNDNetwor
         CheckpointCallback(
             save_freq=config.save_freq // config.n_envs,
             save_path=os.path.join(config.log_dir, "checkpoints"),
-            name_prefix="ppo_rnd",
+            name_prefix="recurrent_ppo_rnd",
         ),
     ]
     wandb_callback = get_wandb_callback(config, log_dir=config.log_dir)
@@ -444,7 +486,7 @@ def train_ppo_rnd(config: Optional[PPORNDConfig] = None) -> Tuple[PPO, RNDNetwor
         )
 
         # Save final model and RND network
-        final_path = os.path.join(config.log_dir, "ppo_rnd_final")
+        final_path = os.path.join(config.log_dir, "recurrent_ppo_rnd_final")
         model.save(final_path)
 
         rnd_path = os.path.join(config.log_dir, "rnd_network.pt")
@@ -458,36 +500,38 @@ def train_ppo_rnd(config: Optional[PPORNDConfig] = None) -> Tuple[PPO, RNDNetwor
     return model, rnd_network
 
 
-def evaluate_ppo_rnd(
+def evaluate_recurrent_ppo_rnd(
     model_path: str,
     env_id: str = "MiniWorld-OneRoom-v0",
     n_episodes: int = 100,
     render: bool = False,
     render_fps: float = 0.0,
 ) -> Dict[str, float]:
-    """Evaluate a trained PPO + RND model (without intrinsic rewards)."""
+    """Evaluate a trained RecurrentPPO + RND model (without intrinsic rewards)."""
 
-    model = PPO.load(model_path)
+    model = RecurrentPPO.load(model_path)
 
     return evaluate_sb3_agent(
         model=model,
         env_id=env_id,
         n_episodes=n_episodes,
-        frame_stack=4,
+        # LSTM handles temporal context
+        frame_stack=1,
         render=render,
         render_fps=render_fps,
         deterministic=True,
-        is_recurrent=False,
+        is_recurrent=True,
     )
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Train PPO + RND agent")
+    parser = argparse.ArgumentParser(description="Train RecurrentPPO + RND agent")
     parser.add_argument("--env", type=str, default="MiniWorld-OneRoom-v0")
     parser.add_argument("--timesteps", type=int, default=2_000_000)
     parser.add_argument("--n-envs", type=int, default=8)
+    parser.add_argument("--lstm-hidden", type=int, default=256)
     parser.add_argument("--intrinsic-coef", type=float, default=1.0,
                         help="Initial intrinsic reward coefficient")
     parser.add_argument("--intrinsic-coef-min", type=float, default=0.01,
@@ -499,15 +543,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.eval:
-        evaluate_ppo_rnd(args.eval, env_id=args.env)
+        evaluate_recurrent_ppo_rnd(args.eval, env_id=args.env)
     else:
-        config = PPORNDConfig(
+        config = RecurrentPPORNDConfig(
             env_id=args.env,
             total_timesteps=args.timesteps,
             n_envs=args.n_envs,
+            lstm_hidden_size=args.lstm_hidden,
             intrinsic_reward_coef=args.intrinsic_coef,
             intrinsic_reward_coef_min=args.intrinsic_coef_min,
             intrinsic_decay_rate=args.decay_rate,
             seed=args.seed,
         )
-        train_ppo_rnd(config)
+        train_recurrent_ppo_rnd(config)

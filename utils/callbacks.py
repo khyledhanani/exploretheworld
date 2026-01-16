@@ -19,6 +19,20 @@ class MetricsCallback(BaseCallback):
         self.episode_rewards = []
         self.episode_lengths = []
         self.episode_successes = []
+        self._wandb = None
+        self._wandb_checked = False
+
+    def _get_wandb(self):
+        """Lazy load wandb if available."""
+        if not self._wandb_checked:
+            self._wandb_checked = True
+            try:
+                import wandb
+                if wandb.run is not None:
+                    self._wandb = wandb
+            except ImportError:
+                pass
+        return self._wandb
 
     def _on_step(self) -> bool:
         # Check for episode completion in infos
@@ -36,9 +50,23 @@ class MetricsCallback(BaseCallback):
             recent_lengths = self.episode_lengths[-100:]
             recent_successes = self.episode_successes[-100:]
 
-            self.logger.record("rollout/mean_reward", np.mean(recent_rewards))
-            self.logger.record("rollout/mean_length", np.mean(recent_lengths))
-            self.logger.record("rollout/success_rate", np.mean(recent_successes))
+            mean_reward = np.mean(recent_rewards)
+            mean_length = np.mean(recent_lengths)
+            success_rate = np.mean(recent_successes)
+
+            self.logger.record("rollout/mean_reward", mean_reward)
+            self.logger.record("rollout/mean_length", mean_length)
+            self.logger.record("rollout/success_rate", success_rate)
+
+            # Also log directly to wandb
+            wandb = self._get_wandb()
+            if wandb is not None:
+                wandb.log({
+                    "rollout/mean_reward": mean_reward,
+                    "rollout/mean_length": mean_length,
+                    "rollout/success_rate": success_rate,
+                    "rollout/num_episodes": len(self.episode_rewards),
+                }, step=self.num_timesteps)
 
         return True
 

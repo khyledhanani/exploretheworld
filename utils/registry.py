@@ -80,6 +80,19 @@ AGENT_REGISTRY: Dict[str, AgentInfo] = {
         evaluate_func="evaluate_dreamer",
         extra_args=[],
     ),
+    "recurrent_rnd": AgentInfo(
+        name="recurrent_rnd",
+        display_name="RecurrentPPO + RND",
+        module="agents.recurrent_ppo_rnd",
+        config_class="RecurrentPPORNDConfig",
+        train_func="train_recurrent_ppo_rnd",
+        evaluate_func="evaluate_recurrent_ppo_rnd",
+        extra_args=[
+            ("--n-envs", int, 8, "Number of parallel environments"),
+            ("--lstm-hidden", int, 256, "LSTM hidden size"),
+            ("--intrinsic-coef", float, 1.0, "Initial intrinsic reward coefficient"),
+        ],
+    ),
 }
 
 
@@ -99,6 +112,8 @@ def infer_agent_type(model_path: str) -> Optional[str]:
 
     # Order matters: check more specific patterns first
     patterns = [
+        ("recurrent_ppo_rnd", "recurrent_rnd"),
+        ("recurrent_rnd", "recurrent_rnd"),
         ("ppo_rnd", "rnd"),
         ("rnd", "rnd"),
         ("recurrent", "recurrent"),

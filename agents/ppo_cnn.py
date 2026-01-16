@@ -4,7 +4,7 @@ PPO CNN with FrameStack
 
 import os
 from dataclasses import dataclass
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 import torch.nn as nn
 from stable_baselines3 import PPO
@@ -14,6 +14,7 @@ from utils.env_utils import make_vec_env
 from utils.callbacks import MetricsCallback
 from utils.feature_extractors import get_extractor
 from utils.evaluator import evaluate_sb3_agent
+from utils.wandb_utils import init_wandb, get_wandb_callback, finish_wandb
 import miniworld
 
 
@@ -50,6 +51,13 @@ class PPOConfig:
 
     log_dir: str = "logs/ppo_cnn"
     save_freq: int = 50000
+    wandb_enabled: bool = True
+    wandb_project: str = "worldmodels"
+    wandb_entity: Optional[str] = None
+    wandb_group: Optional[str] = None
+    wandb_tags: Optional[List[str]] = None
+    wandb_run_name: Optional[str] = None
+    wandb_mode: str = "online"
 
 
 def create_ppo_agent(config: PPOConfig) -> PPO:
@@ -114,28 +122,35 @@ def train_ppo(config: Optional[PPOConfig] = None) -> PPO:
     print(f"Total timesteps: {config.total_timesteps:,}")
     print("=" * 60)
 
+    run = init_wandb(config, "ppo", log_dir=config.log_dir)
     model = create_ppo_agent(config)
 
-    callbacks = CallbackList([
+    callbacks = [
         MetricsCallback(verbose=1),
         CheckpointCallback(
             save_freq=config.save_freq // config.n_envs,
             save_path=os.path.join(config.log_dir, "checkpoints"),
             name_prefix="ppo_cnn",
         ),
-    ])
+    ]
+    wandb_callback = get_wandb_callback(config, log_dir=config.log_dir)
+    if wandb_callback is not None:
+        callbacks.append(wandb_callback)
 
-    # Train
-    model.learn(
-        total_timesteps=config.total_timesteps,
-        callback=callbacks,
-        progress_bar=True,
-    )
+    try:
+        # Train
+        model.learn(
+            total_timesteps=config.total_timesteps,
+            callback=CallbackList(callbacks),
+            progress_bar=True,
+        )
 
-    # Save final model
-    final_path = os.path.join(config.log_dir, "ppo_cnn_final")
-    model.save(final_path)
-    print(f"Model saved to {final_path}")
+        # Save final model
+        final_path = os.path.join(config.log_dir, "ppo_cnn_final")
+        model.save(final_path)
+        print(f"Model saved to {final_path}")
+    finally:
+        finish_wandb(run)
 
     return model
 

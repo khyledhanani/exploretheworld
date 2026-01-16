@@ -7,7 +7,7 @@ For true partial observability where the agent needs to remember past observatio
 
 import os
 from dataclasses import dataclass
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
@@ -16,6 +16,7 @@ from utils.env_utils import make_vec_env
 from utils.callbacks import MetricsCallback
 from utils.feature_extractors import get_extractor
 from utils.evaluator import evaluate_sb3_agent
+from utils.wandb_utils import init_wandb, get_wandb_callback, finish_wandb
 
 
 @dataclass
@@ -64,6 +65,13 @@ class RecurrentPPOConfig:
     # Logging
     log_dir: str = "logs/recurrent_ppo"
     save_freq: int = 50000
+    wandb_enabled: bool = True
+    wandb_project: str = "worldmodels"
+    wandb_entity: Optional[str] = None
+    wandb_group: Optional[str] = None
+    wandb_tags: Optional[List[str]] = None
+    wandb_run_name: Optional[str] = None
+    wandb_mode: str = "online"
 
 
 def create_recurrent_ppo_agent(config: RecurrentPPOConfig) -> RecurrentPPO:
@@ -137,29 +145,36 @@ def train_recurrent_ppo(config: Optional[RecurrentPPOConfig] = None) -> Recurren
     print(f"Total timesteps: {config.total_timesteps:,}")
     print("=" * 60)
 
+    run = init_wandb(config, "recurrent_ppo", log_dir=config.log_dir)
     model = create_recurrent_ppo_agent(config)
 
     # Setup callbacks
-    callbacks = CallbackList([
+    callbacks = [
         MetricsCallback(verbose=1),
         CheckpointCallback(
             save_freq=config.save_freq // config.n_envs,
             save_path=os.path.join(config.log_dir, "checkpoints"),
             name_prefix="recurrent_ppo",
         ),
-    ])
+    ]
+    wandb_callback = get_wandb_callback(config, log_dir=config.log_dir)
+    if wandb_callback is not None:
+        callbacks.append(wandb_callback)
 
-    # Train
-    model.learn(
-        total_timesteps=config.total_timesteps,
-        callback=callbacks,
-        progress_bar=True,
-    )
+    try:
+        # Train
+        model.learn(
+            total_timesteps=config.total_timesteps,
+            callback=CallbackList(callbacks),
+            progress_bar=True,
+        )
 
-    # Save final model
-    final_path = os.path.join(config.log_dir, "recurrent_ppo_final")
-    model.save(final_path)
-    print(f"Model saved to {final_path}")
+        # Save final model
+        final_path = os.path.join(config.log_dir, "recurrent_ppo_final")
+        model.save(final_path)
+        print(f"Model saved to {final_path}")
+    finally:
+        finish_wandb(run)
 
     return model
 
